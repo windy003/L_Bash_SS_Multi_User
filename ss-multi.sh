@@ -61,6 +61,21 @@ rand_pass() {
     head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16
 }
 
+# 随机挑一个高位端口 (10000-60000)，避开已有配置和当前正在监听的端口
+rand_port() {
+    local p ports used i
+    ports=" $(list_ports 2>/dev/null | tr '\n' ' ') "
+    used=" $(listening_ports 2>/dev/null) "
+    for i in $(seq 1 200); do
+        p=$(( RANDOM % 50001 + 10000 ))
+        [[ "$ports" == *" $p "* ]] && continue
+        [[ "$used" == *" $p "* ]] && continue
+        printf '%s' "$p"
+        return 0
+    done
+    return 1
+}
+
 b64url() {
     printf '%s' "$1" | base64 -w0 | tr '+/' '-_' | tr -d '='
 }
@@ -466,9 +481,10 @@ view_configs() {
 # 功能: 新增配置
 # ----------------------------------------------------------------------------
 add_config() {
-    local port pw name used
+    local port pw name used def
+    def=$(rand_port) || def=""
     while :; do
-        port=$(ask_input "新增配置" "请输入端口号 (1-65535)\n建议使用 10000-60000 之间的高位端口" "") || return 0
+        port=$(ask_input "新增配置" "请输入端口号 (1-65535)\n建议使用 10000-60000 之间的高位端口\n已随机预填一个可用端口，直接回车即可使用" "$def") || return 0
         port=$(printf '%s' "$port" | tr -d '[:space:]')
         if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
             msg "端口无效，请输入 1-65535 之间的数字。" "错误"
