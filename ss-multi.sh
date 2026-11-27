@@ -13,12 +13,7 @@
 #    * 一键卸载（可单独选择卸载软件包）
 #
 #  用法:
-#    sudo bash ss-multi.sh            # 打开管理面板
-#    sudo bash ss-multi.sh links      # 仅输出全部 ss:// 链接
-#    sudo bash ss-multi.sh list       # 仅输出配置列表
-#    sudo bash ss-multi.sh restart    # 重启服务
-#    sudo bash ss-multi.sh status     # 查看服务状态
-#    sudo bash ss-multi.sh uninstall  # 卸载面板并清理配置
+#    sudo bash ss-multi.sh            # 打开管理面板（所有操作均在 TUI 内完成）
 #
 #  依赖: shadowsocks-libev, jq, curl, whiptail（首次运行自动安装）
 # =============================================================================
@@ -210,7 +205,7 @@ bbr_supported() {
 }
 
 # 幂等: 已启用则直接返回；首次写入 /etc/sysctl.d 并立即生效。
-# 提示信息走 stderr，避免污染 `links` 等命令的 stdout 输出。
+# 提示信息走 stderr，避免污染需要被 $(...) 捕获的 stdout 输出。
 ensure_bbr() {
     if [ "$(cc_current)" = "bbr" ] && [ -f "$BBR_CONF" ]; then
         return 0
@@ -297,13 +292,6 @@ gen_link_for() {
     n=$(get_name "$p")
     [ -z "$n" ] && n="SS-$p"
     printf 'ss://%s@%s:%s#%s\n' "$(b64url "${m}:${pw}")" "$host" "$p" "$(urlenc "$n")"
-}
-
-gen_all_links() {
-    local p
-    while read -r p; do
-        [ -n "$p" ] && gen_link_for "$p"
-    done < <(list_ports)
 }
 
 copy_clip() {
@@ -710,49 +698,6 @@ main_menu() {
 # ----------------------------------------------------------------------------
 main() {
     require_root
-
-    case "${1:-}" in
-        links)
-            bootstrap; init_conf
-            SERVER_IP=$(detect_ip)
-            gen_all_links
-            exit 0
-            ;;
-        list)
-            bootstrap; init_conf
-            while read -r p; do
-                [ -z "$p" ] && continue
-                printf '%s\t%s\n' "$p" "$(get_name "$p")"
-            done < <(list_ports)
-            exit 0
-            ;;
-        restart)
-            bootstrap; init_conf
-            if svc_restart; then echo "重启成功"; else echo "重启失败"; exit 1; fi
-            exit 0
-            ;;
-        status)
-            bootstrap; init_conf
-            systemctl status "$SVC" --no-pager -l
-            exit 0
-            ;;
-        uninstall)
-            [ -t 0 ] || die "卸载需要交互式终端确认，请在终端中运行"
-            command -v whiptail >/dev/null 2>&1 || die "缺少 whiptail，请先安装: apt-get install -y whiptail"
-            do_uninstall
-            exit $?
-            ;;
-        ""|-h|--help|help)
-            if [ -n "${1:-}" ]; then
-                sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
-                exit 0
-            fi
-            ;;
-        *)
-            die "未知参数: $1 (可用: links | list | restart | status | uninstall)"
-            ;;
-    esac
-
     [ -t 0 ] || die "请在交互式终端中运行本脚本"
     bootstrap
     init_conf
@@ -760,4 +705,4 @@ main() {
     main_menu
 }
 
-main "$@"
+main
