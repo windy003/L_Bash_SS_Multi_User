@@ -10,6 +10,7 @@
 #    * 查看 ss:// 链接，支持 OSC52 复制到本地剪贴板 / 终端显示 / 导出文件
 #    * 服务状态查看、重启、加密方式切换、ufw 放行
 #    * 默认启用 TCP BBR 拥塞控制（内核级，对所有端口/配置统一生效）
+#    * 一键卸载（可单独选择清理 ufw / BBR / 软件包）
 #
 #  用法:
 #    sudo bash ss-multi.sh            # 打开管理面板
@@ -17,6 +18,7 @@
 #    sudo bash ss-multi.sh list       # 仅输出配置列表
 #    sudo bash ss-multi.sh restart    # 重启服务
 #    sudo bash ss-multi.sh status     # 查看服务状态
+#    sudo bash ss-multi.sh uninstall  # 卸载面板并清理配置
 #
 #  依赖: shadowsocks-libev, jq, curl, whiptail（首次运行自动安装）
 # =============================================================================
@@ -300,6 +302,8 @@ term_show() {
 # ----------------------------------------------------------------------------
 msg()    { whiptail --backtitle "$BACKTITLE" --title "${2:-提示}"     --msgbox "$1" 0 76 3>&1 1>&2 2>&3; }
 confirm(){ whiptail --backtitle "$BACKTITLE" --title "${2:-确认}"     --yesno  "$1" 0 70 3>&1 1>&2 2>&3; }
+# 危险操作使用: 默认焦点在「否」，回车不会误删
+confirm_no(){ whiptail --backtitle "$BACKTITLE" --title "${2:-确认}" --defaultno --yesno "$1" 0 70 3>&1 1>&2 2>&3; }
 ask_input() { whiptail --backtitle "$BACKTITLE" --title "$1" --inputbox    "$2" 10 66 "$3" 3>&1 1>&2 2>&3; }
 ask_pass()  { whiptail --backtitle "$BACKTITLE" --title "$1" --passwordbox "$2" 10 66 "$3" 3>&1 1>&2 2>&3; }
 
@@ -640,6 +644,61 @@ bbr_menu() {
 }
 
 # ----------------------------------------------------------------------------
+# 功能: 卸载
+#   所有确认默认都是「否」，避免误触。
+# ----------------------------------------------------------------------------
+do_uninstall() {
+    local ports port list rmv_ufw=0 rmv_bbr=0 rmv_pkg=0
+    ports=$(list_ports 2>/dev/null || true)
+    list=$(printf '%s\n' "$ports" | grep -v '^$' | paste -sd ',' - 2>/dev/null)
+    [ -z "$list" ] && list="无"
+
+    confirm_no "即将卸载 Shadowsocks 多用户面板，将执行:\n\n  - 停止并禁用服务: $SVC\n  - 删除 systemd 单元: $UNIT_FILE\n  - 删除配置目录: $CONF_DIR\n    (含全部端口、密码、备注)\n\n此操作不可恢复！确定继续？" "卸载确认" || return 1
+
+    confirm_no "是否同时删除 ufw 中已放行的端口规则？\n\n端口: $list" "防火墙规则" && rmv_ufw=1
+    confirm_no "是否移除本脚本添加的 BBR 优化配置？\n\n将删除 $BBR_CONF 并把拥塞控制恢复为 cubic。\n若想保留系统级 BBR 加速，请选「否」。" "BBR 设置" && rmv_bbr=1
+    confirm_no "是否卸载 shadowsocks-libev 软件包？\n\n注意: 若系统上还有其它程序依赖它，请选「否」。" "软件包" && rmv_pkg=1
+
+    # 1) 停止并移除服务
+    systemctl disable --now "$SVC" >/dev/null 2>&1 || true
+    rm -f "$UNIT_FILE"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
+    # 2) 清理 ufw 规则（使用卸载前缓存的端口列表）
+    if [ "$rmv_ufw" -eq 1 ] && command -v ufw >/dev/null 2>&1; then
+        while read -r port; do
+            [ -z "$port" ] && continue
+            ufw delete allow "$port/tcp" >/dev/null 2>&1 || true
+            ufw delete allow "$port/udp" >/dev/null 2>&1 || true
+        done <<< "$ports"
+    fi
+
+    # 3) 删除配置
+    rm -rf "$CONF_DIR"
+
+    # 4) 回退 BBR
+    if [ "$rmv_bbr" -eq 1 ]; then
+        rm -f "$BBR_CONF"
+        sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
+    fi
+
+    # 5) 卸载软件包
+    if [ "$rmv_pkg" -eq 1 ]; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get remove -y shadowsocks-libev >/dev/null 2>&1 || true
+    fi
+
+    local ufw_txt="保留" bbr_txt="保留" pkg_txt="保留" extra=""
+    [ "$rmv_ufw" -eq 1 ] && ufw_txt="已清理"
+    [ "$rmv_bbr" -eq 1 ] && bbr_txt="已移除"
+    [ "$rmv_pkg" -eq 1 ] && pkg_txt="已卸载"
+    [ -f /root/ss-links.txt ] && extra="\n\n提示: 导出的链接文件仍在 /root/ss-links.txt\n如需删除: rm -f /root/ss-links.txt"
+
+    msg "卸载完成。\n\n  - 服务 / systemd 单元 : 已移除\n  - 配置目录            : 已删除\n  - ufw 端口规则        : $ufw_txt\n  - BBR 优化            : $bbr_txt\n  - shadowsocks-libev   : $pkg_txt$extra" "完成"
+    return 0
+}
+
+# ----------------------------------------------------------------------------
 # 主菜单
 # ----------------------------------------------------------------------------
 main_menu() {
@@ -658,6 +717,7 @@ main_menu() {
             "7" "服务状态 / 重启 / 停止" \
             "8" "防火墙放行已有端口 (ufw)" \
             "9" "网络优化 / BBR 拥塞控制" \
+            "10" "卸载面板 / 清理配置" \
             "0" "退出" 3>&1 1>&2 2>&3) || break
         case "$c" in
             1) view_configs ;;
@@ -669,6 +729,7 @@ main_menu() {
             7) service_menu ;;
             8) fw_sync_all ;;
             9) bbr_menu ;;
+            10) if do_uninstall; then clear; echo "卸载完成，再见。"; exit 0; fi ;;
             0) break ;;
         esac
     done
@@ -707,14 +768,20 @@ main() {
             systemctl status "$SVC" --no-pager -l
             exit 0
             ;;
+        uninstall)
+            [ -t 0 ] || die "卸载需要交互式终端确认，请在终端中运行"
+            command -v whiptail >/dev/null 2>&1 || die "缺少 whiptail，请先安装: apt-get install -y whiptail"
+            do_uninstall
+            exit $?
+            ;;
         ""|-h|--help|help)
             if [ -n "${1:-}" ]; then
-                sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+                sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
                 exit 0
             fi
             ;;
         *)
-            die "未知参数: $1 (可用: links | list | restart | status)"
+            die "未知参数: $1 (可用: links | list | restart | status | uninstall)"
             ;;
     esac
 
