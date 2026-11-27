@@ -9,8 +9,8 @@
 #    * 新增 / 删除配置、修改密码
 #    * 在「查看所有配置」中逐个查看详情、复制 ss:// 链接（OSC52）/ 终端显示
 #    * 服务状态查看、重启、ufw 放行
-#    * 默认启用 TCP BBR 拥塞控制（内核级，对所有端口/配置统一生效）
-#    * 一键卸载（可单独选择清理 ufw / BBR / 软件包）
+#    * 后台自动启用 TCP BBR 拥塞控制（无菜单入口，对所有端口/配置统一生效）
+#    * 一键卸载（可单独选择清理 ufw / 软件包）
 #
 #  用法:
 #    sudo bash ss-multi.sh            # 打开管理面板
@@ -206,14 +206,6 @@ bbr_supported() {
     local avail
     avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
     [[ " $avail " == *" bbr "* ]]
-}
-
-bbr_state_text() {
-    if [ "$(cc_current)" = "bbr" ]; then
-        echo "已启用 (bbr)"
-    else
-        echo "未启用 ($(cc_current))"
-    fi
 }
 
 # 幂等: 已启用则直接返回；首次写入 /etc/sysctl.d 并立即生效。
@@ -471,7 +463,7 @@ view_configs() {
         done
 
         sel=$(menu_pick "配置列表" \
-            "服务: $(svc_state_text)   加密: $(cfg_method)   BBR: $(bbr_state_text)\n服务器: ${SERVER_IP:-未知}   配置数: ${#ports[@]}\n\n选择配置查看信息 / 复制 ss:// 链接" \
+            "服务: $(svc_state_text)   加密: $(cfg_method)\n服务器: ${SERVER_IP:-未知}   配置数: ${#ports[@]}\n\n选择配置查看信息 / 复制 ss:// 链接" \
             "${items[@]}") || return 0
         config_detail "$sel"
     done
@@ -646,25 +638,12 @@ fw_sync_all() {
     msg "已为所有配置端口放行 TCP/UDP。" "完成"
 }
 
-bbr_menu() {
-    local avail
-    avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo 未知)
-    if ! confirm "当前拥塞控制: $(bbr_state_text)\n可用算法: $avail\n\nBBR 是内核级优化，对本面板中的所有配置(端口)同时生效，\n无需逐个端口设置。\n\n是否立即应用 / 重新应用 BBR？" "网络优化 (BBR)"; then
-        return 0
-    fi
-    if ensure_bbr; then
-        msg "BBR 已启用。\n\n拥塞控制: $(cc_current)\n队列规则: $(sysctl -n net.core.default_qdisc 2>/dev/null || echo 未知)\n\n对所有配置(端口)生效。" "完成"
-    else
-        msg "BBR 启用失败。\n\n当前拥塞控制: $(cc_current)\n可用算法: $avail\n\n常见原因:\n  - 内核低于 4.9 (uname -r 查看)\n  - 运行在容器 / 受限环境" "失败"
-    fi
-}
-
 # ----------------------------------------------------------------------------
 # 功能: 卸载
 #   所有确认默认都是「否」，避免误触。
 # ----------------------------------------------------------------------------
 do_uninstall() {
-    local ports port list rmv_ufw=0 rmv_bbr=0 rmv_pkg=0
+    local ports port list rmv_ufw=0 rmv_pkg=0
     ports=$(list_ports 2>/dev/null || true)
     list=$(printf '%s\n' "$ports" | grep -v '^$' | paste -sd ',' - 2>/dev/null)
     [ -z "$list" ] && list="无"
@@ -672,7 +651,6 @@ do_uninstall() {
     confirm_no "即将卸载 Shadowsocks 多用户面板，将执行:\n\n  - 停止并禁用服务: $SVC\n  - 删除 systemd 单元: $UNIT_FILE\n  - 删除配置目录: $CONF_DIR\n    (含全部端口、密码、备注)\n\n此操作不可恢复！确定继续？" "卸载确认" || return 1
 
     confirm_no "是否同时删除 ufw 中已放行的端口规则？\n\n端口: $list" "防火墙规则" && rmv_ufw=1
-    confirm_no "是否移除本脚本添加的 BBR 优化配置？\n\n将删除 $BBR_CONF 并把拥塞控制恢复为 cubic。\n若想保留系统级 BBR 加速，请选「否」。" "BBR 设置" && rmv_bbr=1
     confirm_no "是否卸载 shadowsocks-libev 软件包？\n\n注意: 若系统上还有其它程序依赖它，请选「否」。" "软件包" && rmv_pkg=1
 
     # 1) 停止并移除服务
@@ -692,11 +670,9 @@ do_uninstall() {
     # 3) 删除配置
     rm -rf "$CONF_DIR"
 
-    # 4) 回退 BBR
-    if [ "$rmv_bbr" -eq 1 ]; then
-        rm -f "$BBR_CONF"
-        sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
-    fi
+    # 4) 回退本脚本写入的 BBR 配置
+    rm -f "$BBR_CONF"
+    sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
 
     # 5) 卸载软件包
     if [ "$rmv_pkg" -eq 1 ]; then
@@ -704,12 +680,11 @@ do_uninstall() {
         apt-get remove -y shadowsocks-libev >/dev/null 2>&1 || true
     fi
 
-    local ufw_txt="保留" bbr_txt="保留" pkg_txt="保留"
+    local ufw_txt="保留" pkg_txt="保留"
     [ "$rmv_ufw" -eq 1 ] && ufw_txt="已清理"
-    [ "$rmv_bbr" -eq 1 ] && bbr_txt="已移除"
     [ "$rmv_pkg" -eq 1 ] && pkg_txt="已卸载"
 
-    msg "卸载完成。\n\n  - 服务 / systemd 单元 : 已移除\n  - 配置目录            : 已删除\n  - ufw 端口规则        : $ufw_txt\n  - BBR 优化            : $bbr_txt\n  - shadowsocks-libev   : $pkg_txt" "完成"
+    msg "卸载完成。\n\n  - 服务 / systemd 单元 : 已移除\n  - 配置目录            : 已删除\n  - ufw 端口规则        : $ufw_txt\n  - BBR 优化            : 已移除\n  - shadowsocks-libev   : $pkg_txt" "完成"
     return 0
 }
 
@@ -720,15 +695,14 @@ main_menu() {
     local c
     while :; do
         c=$(menu_pick "Shadowsocks 管理面板" \
-            "服务: $(svc_state_text)   配置数: $(count_ports)   加密: $(cfg_method)\nBBR: $(bbr_state_text)" \
+            "服务: $(svc_state_text)   配置数: $(count_ports)   加密: $(cfg_method)" \
             "1" "查看所有配置 (含复制链接)" \
             "2" "新增配置 (端口 + 密码)" \
             "3" "删除配置" \
             "4" "修改密码" \
             "5" "服务状态 / 重启 / 停止" \
             "6" "防火墙放行已有端口 (ufw)" \
-            "7" "网络优化 / BBR 拥塞控制" \
-            "8" "卸载面板 / 清理配置") || break
+            "7" "卸载面板 / 清理配置") || break
         case "$c" in
             1) view_configs ;;
             2) add_config ;;
@@ -736,8 +710,7 @@ main_menu() {
             4) change_password ;;
             5) service_menu ;;
             6) fw_sync_all ;;
-            7) bbr_menu ;;
-            8) if do_uninstall; then clear; echo "卸载完成，再见。"; exit 0; fi ;;
+            7) if do_uninstall; then clear; echo "卸载完成，再见。"; exit 0; fi ;;
         esac
     done
     clear
