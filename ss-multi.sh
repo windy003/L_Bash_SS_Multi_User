@@ -7,7 +7,7 @@
 #    * whiptail TUI 管理界面
 #    * 一个配置 = 一个端口 + 一个密码（同一个 ss-server 进程内并行）
 #    * 新增 / 删除配置、修改密码
-#    * 查看 ss:// 链接，支持 OSC52 复制到本地剪贴板 / 终端显示 / 导出文件
+#    * 在「查看所有配置」中逐个查看详情、复制 ss:// 链接（OSC52）/ 终端显示
 #    * 服务状态查看、重启、加密方式切换、ufw 放行
 #    * 默认启用 TCP BBR 拥塞控制（内核级，对所有端口/配置统一生效）
 #    * 一键卸载（可单独选择清理 ufw / BBR / 软件包）
@@ -325,34 +325,66 @@ pick_port() {
 
 # ----------------------------------------------------------------------------
 # 功能: 查看列表
+#   列出所有配置；选中某个配置后查看详情，并可复制它的 ss:// 链接。
 # ----------------------------------------------------------------------------
+config_detail() {
+    local port=$1 n pw st link tf c
+    n=$(get_name "$port"); [ -z "$n" ] && n="配置-$port"
+    pw=$(get_pass "$port"); [ -z "$pw" ] && pw="(缺失)"
+    if [[ " $(listening_ports) " == *" $port "* ]]; then st="监听着"; else st="未监听"; fi
+
+    link=$(gen_link_for "$port" 2>/dev/null) || true
+    [ -z "$link" ] && link="(无法生成，密码缺失)"
+
+    while :; do
+        c=$(whiptail --backtitle "$BACKTITLE" --title "配置详情 · 端口 $port" --menu \
+            "名称 : $n\n端口 : $port\n密码 : $pw\n状态 : $st\n\n请选择操作:" \
+            21 74 4 \
+            "1" "复制 ss:// 链接到剪贴板" \
+            "2" "在终端显示完整链接" \
+            "0" "返回" 3>&1 1>&2 2>&3) || return 0
+        case "$c" in
+            1)
+                copy_clip "$link"
+                msg "已发送复制指令到终端:\n\n$link\n\n如果剪贴板没有内容（终端不支持 OSC52），\n请改用「在终端显示完整链接」手动复制。" "已复制"
+                ;;
+            2)
+                tf=$(mktemp)
+                printf '%s\n' "$link" > "$tf"
+                term_show "$tf" "端口 $port 的 SS 链接"
+                rm -f "$tf"
+                ;;
+            0|*) return 0 ;;
+        esac
+    done
+}
+
 view_configs() {
-    local f p pw n ls lst
-    f=$(mktemp)
-    lst=$(listening_ports)
-    {
-        printf '服务状态 : %s\n' "$(svc_state_text)"
-        printf '加密方式 : %s\n' "$(cfg_method)"
-        printf '拥塞控制 : %s\n' "$(bbr_state_text)"
-        printf '配置数量 : %s\n' "$(count_ports)"
-        printf '配置文件 : %s\n' "$CONF_FILE"
-        printf '服务器IP : %s\n\n' "${SERVER_IP:-未知}"
-        while read -r p; do
+    local ports=() items=() p n st sel lst ip
+    mapfile -t ports < <(list_ports)
+    if [ "${#ports[@]}" -eq 0 ]; then
+        msg "当前还没有任何配置，请先新增。" "提示"
+        return 0
+    fi
+    ip=$(detect_ip); [ -n "$ip" ] && SERVER_IP=$ip
+
+    while :; do
+        lst=$(listening_ports)
+        items=()
+        for p in "${ports[@]}"; do
             [ -z "$p" ] && continue
-            pw=$(get_pass "$p")
-            n=$(get_name "$p"); [ -z "$n" ] && n="-"
-            if [[ " $lst " == *" $p "* ]]; then ls="监听着"; else ls="未监听"; fi
-            printf '────────────────────────────────────────────────────\n'
-            printf '  端口 : %s\n' "$p"
-            printf '  名称 : %s\n' "$n"
-            printf '  密码 : %s\n' "$pw"
-            printf '  状态 : %s\n' "$ls"
-        done < <(list_ports)
-        printf '────────────────────────────────────────────────────\n'
-    } > "$f"
-    whiptail --backtitle "$BACKTITLE" --title "配置列表" --scrolltext \
-        --textbox "$f" 24 78 3>&1 1>&2 2>&3
-    rm -f "$f"
+            n=$(get_name "$p"); [ -z "$n" ] && n="配置-$p"
+            if [[ " $lst " == *" $p "* ]]; then st="[运行]"; else st="[停止]"; fi
+            items+=("$p" "$st $n")
+        done
+        items+=("0" "返回")
+
+        sel=$(whiptail --backtitle "$BACKTITLE" --title "配置列表" --menu \
+            "服务: $(svc_state_text)   加密: $(cfg_method)   BBR: $(bbr_state_text)\n服务器: ${SERVER_IP:-未知}   配置数: ${#ports[@]}\n\n选中某个配置可查看信息 / 复制 ss:// 链接" \
+            22 74 12 "${items[@]}" 3>&1 1>&2 2>&3) || return 0
+        [ "$sel" = "0" ] && return 0
+        config_detail "$sel"
+    done
 }
 
 # ----------------------------------------------------------------------------
@@ -463,80 +495,6 @@ change_password() {
     else
         msg "服务重启失败，请查看日志:\n  journalctl -u $SVC -n 50" "错误"
     fi
-}
-
-# ----------------------------------------------------------------------------
-# 功能: SS 链接
-# ----------------------------------------------------------------------------
-copy_one_link() {
-    local port link
-    port=$(pick_port "选择要复制的配置") || return 0
-    link=$(gen_link_for "$port")
-    copy_clip "$link"
-    msg "已发送复制指令到终端:\n\n$link\n\n如果没有复制成功（终端不支持 OSC52），\n请改用「在终端显示」手动复制。" "已复制"
-}
-
-copy_all_links() {
-    local f
-    f=$(mktemp)
-    gen_all_links > "$f"
-    copy_clip "$(cat "$f")"
-    local cnt; cnt=$(wc -l < "$f")
-    rm -f "$f"
-    msg "已把 $cnt 条链接发送到终端剪贴板。\n\n如果剪贴板为空，说明终端不支持 OSC52，\n请改用「在终端显示全部链接」。" "已复制"
-}
-
-display_all_links() {
-    local f
-    f=$(mktemp)
-    { printf '# 服务器: %s   加密: %s   生成时间: %s\n\n' "$SERVER_IP" "$(cfg_method)" "$(date '+%F %T')"; gen_all_links; } > "$f"
-    term_show "$f" "全部 SS 链接"
-    rm -f "$f"
-}
-
-display_one_link() {
-    local port f
-    port=$(pick_port "选择要显示的配置") || return 0
-    f=$(mktemp)
-    gen_link_for "$port" > "$f"
-    term_show "$f" "端口 $port 的 SS 链接"
-    rm -f "$f"
-}
-
-export_links() {
-    local out="/root/ss-links.txt"
-    {
-        printf '# 服务器: %s\n' "$SERVER_IP"
-        printf '# 加密方式: %s\n' "$(cfg_method)"
-        printf '# 生成时间: %s\n\n' "$(date '+%F %T')"
-        gen_all_links
-    } > "$out"
-    chmod 600 "$out"
-    msg "全部链接已导出到:\n\n$out\n\n查看: cat $out" "导出完成"
-}
-
-show_links_menu() {
-    SERVER_IP=$(detect_ip)
-    local c
-    while :; do
-        clear
-        c=$(whiptail --backtitle "$BACKTITLE" --title "SS 链接" --menu \
-            "服务器: ${SERVER_IP:-未知}   加密: $(cfg_method)" 20 70 9 \
-            "1" "复制单个配置的链接到剪贴板" \
-            "2" "复制全部链接到剪贴板" \
-            "3" "在终端显示全部链接" \
-            "4" "在终端显示单个配置的链接" \
-            "5" "导出全部链接到 /root/ss-links.txt" \
-            "0" "返回" 3>&1 1>&2 2>&3) || return 0
-        case "$c" in
-            1) copy_one_link ;;
-            2) copy_all_links ;;
-            3) display_all_links ;;
-            4) display_one_link ;;
-            5) export_links ;;
-            0|*) return 0 ;;
-        esac
-    done
 }
 
 # ----------------------------------------------------------------------------
@@ -688,13 +646,12 @@ do_uninstall() {
         apt-get remove -y shadowsocks-libev >/dev/null 2>&1 || true
     fi
 
-    local ufw_txt="保留" bbr_txt="保留" pkg_txt="保留" extra=""
+    local ufw_txt="保留" bbr_txt="保留" pkg_txt="保留"
     [ "$rmv_ufw" -eq 1 ] && ufw_txt="已清理"
     [ "$rmv_bbr" -eq 1 ] && bbr_txt="已移除"
     [ "$rmv_pkg" -eq 1 ] && pkg_txt="已卸载"
-    [ -f /root/ss-links.txt ] && extra="\n\n提示: 导出的链接文件仍在 /root/ss-links.txt\n如需删除: rm -f /root/ss-links.txt"
 
-    msg "卸载完成。\n\n  - 服务 / systemd 单元 : 已移除\n  - 配置目录            : 已删除\n  - ufw 端口规则        : $ufw_txt\n  - BBR 优化            : $bbr_txt\n  - shadowsocks-libev   : $pkg_txt$extra" "完成"
+    msg "卸载完成。\n\n  - 服务 / systemd 单元 : 已移除\n  - 配置目录            : 已删除\n  - ufw 端口规则        : $ufw_txt\n  - BBR 优化            : $bbr_txt\n  - shadowsocks-libev   : $pkg_txt" "完成"
     return 0
 }
 
@@ -708,28 +665,26 @@ main_menu() {
         c=$(whiptail --backtitle "$BACKTITLE" --title " Shadowsocks 管理面板 " --menu \
             "服务: $(svc_state_text)   配置数: $(count_ports)   加密: $(cfg_method)\nBBR: $(bbr_state_text)" \
             22 70 12 \
-            "1" "查看所有配置" \
+            "1" "查看所有配置 (含复制链接)" \
             "2" "新增配置 (端口 + 密码)" \
             "3" "删除配置" \
             "4" "修改密码" \
-            "5" "查看 / 复制 SS 链接" \
-            "6" "更改加密方式" \
-            "7" "服务状态 / 重启 / 停止" \
-            "8" "防火墙放行已有端口 (ufw)" \
-            "9" "网络优化 / BBR 拥塞控制" \
-            "10" "卸载面板 / 清理配置" \
+            "5" "更改加密方式" \
+            "6" "服务状态 / 重启 / 停止" \
+            "7" "防火墙放行已有端口 (ufw)" \
+            "8" "网络优化 / BBR 拥塞控制" \
+            "9" "卸载面板 / 清理配置" \
             "0" "退出" 3>&1 1>&2 2>&3) || break
         case "$c" in
             1) view_configs ;;
             2) add_config ;;
             3) delete_config ;;
             4) change_password ;;
-            5) show_links_menu ;;
-            6) change_method ;;
-            7) service_menu ;;
-            8) fw_sync_all ;;
-            9) bbr_menu ;;
-            10) if do_uninstall; then clear; echo "卸载完成，再见。"; exit 0; fi ;;
+            5) change_method ;;
+            6) service_menu ;;
+            7) fw_sync_all ;;
+            8) bbr_menu ;;
+            9) if do_uninstall; then clear; echo "卸载完成，再见。"; exit 0; fi ;;
             0) break ;;
         esac
     done
