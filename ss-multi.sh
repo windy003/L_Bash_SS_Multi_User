@@ -4,7 +4,7 @@
 # =============================================================================
 #
 #  功能:
-#    * whiptail TUI 管理界面
+#    * 管理界面：菜单按数字键立即选择（无需方向键/回车），输入框使用 whiptail
 #    * 一个配置 = 一个端口 + 一个密码（ss-manager 按端口拉起多个 ss-server 实例）
 #    * 新增 / 删除配置、修改密码
 #    * 在「查看所有配置」中逐个查看详情、复制 ss:// 链接（OSC52）/ 终端显示
@@ -325,6 +325,62 @@ confirm_no(){ whiptail --backtitle "$BACKTITLE" --title "${2:-确认}" --default
 ask_input() { whiptail --backtitle "$BACKTITLE" --title "$1" --inputbox    "$2" 10 66 "$3" 3>&1 1>&2 2>&3; }
 ask_pass()  { whiptail --backtitle "$BACKTITLE" --title "$1" --passwordbox "$2" 10 66 "$3" 3>&1 1>&2 2>&3; }
 
+# 自绘单键菜单：按数字键立即选中，无需方向键 / 回车。
+#   用法: menu_pick <标题> <说明> tag1 desc1 [tag2 desc2 ...]
+#   说明里的 \n 会被展开；超过 9 项自动分页（n 下一页 / p 上一页），q 取消。
+#   界面绘制走 stderr，选中项从 stdout 返回，便于 sel=$(menu_pick ...) 捕获。
+menu_pick() {
+    local title=$1 prompt=$2; shift 2
+    local tags=() descs=() key i page=0 pages=1 per=9 total start end
+    while [ $# -ge 2 ]; do
+        tags+=("$1"); descs+=("$2"); shift 2
+    done
+    total=${#tags[@]}
+    [ "$total" -eq 0 ] && return 1
+    pages=$(( (total + per - 1) / per ))
+
+    while :; do
+        start=$(( page * per ))
+        end=$(( start + per - 1 ))
+        [ "$end" -ge "$total" ] && end=$(( total - 1 ))
+        {
+            clear
+            printf '\n\033[1;36m== %s ==\033[0m\n\n' "$title"
+            [ -n "$prompt" ] && printf '%b\n\n' "$prompt"
+            for ((i = start; i <= end; i++)); do
+                printf '  \033[1;33m%d\033[0m) %s\n' "$(( i - start + 1 ))" "${descs[$i]}"
+            done
+            printf '\n'
+            if [ "$pages" -gt 1 ]; then
+                printf '  \033[2m第 %d/%d 页  n 下一页  p 上一页\033[0m\n' "$(( page + 1 ))" "$pages"
+            fi
+            printf '  \033[2m按数字键立即选择，q 返回\033[0m\n'
+        } >&2
+
+        if ! IFS= read -rsn1 key; then
+            return 1
+        fi
+        case "$key" in
+            q|Q) return 1 ;;
+            n|N) [ $(( page + 1 )) -lt "$pages" ] && page=$(( page + 1 )); continue ;;
+            p|P) [ "$page" -gt 0 ] && page=$(( page - 1 )); continue ;;
+            [1-9])
+                i=$(( start + key - 1 ))
+                if [ "$i" -le "$end" ] && [ "$i" -lt "$total" ]; then
+                    printf '%s' "${tags[$i]}"
+                    return 0
+                fi
+                printf '\a' >&2
+                ;;
+            *)
+                # 吞掉方向键等 ESC 序列，避免一次按键触发多次重绘
+                [ "$key" = $'\e' ] && { IFS= read -rsn2 -t 0.05 _ 2>/dev/null || true; }
+                printf '\a' >&2
+                ;;
+        esac
+    done
+}
+
 pick_port() {
     local title=$1 ports items=() p n sel
     mapfile -t ports < <(list_ports)
@@ -333,11 +389,11 @@ pick_port() {
         return 1
     fi
     for p in "${ports[@]}"; do
+        [ -z "$p" ] && continue
         n=$(get_name "$p"); [ -z "$n" ] && n="配置-$p"
-        items+=("$p" "$n")
+        items+=("$p" "端口 $p · $n")
     done
-    sel=$(whiptail --backtitle "$BACKTITLE" --title "选择配置" --menu "$title" \
-            22 66 12 "${items[@]}" 3>&1 1>&2 2>&3) || return 1
+    sel=$(menu_pick "$title" "按数字键选择，q 取消" "${items[@]}") || return 1
     printf '%s' "$sel"
 }
 
@@ -355,12 +411,10 @@ config_detail() {
     [ -z "$link" ] && link="(无法生成，密码缺失)"
 
     while :; do
-        c=$(whiptail --backtitle "$BACKTITLE" --title "配置详情 · 端口 $port" --menu \
-            "名称 : $n\n端口 : $port\n密码 : $pw\n状态 : $st\n\n请选择操作:" \
-            21 74 4 \
+        c=$(menu_pick "配置详情 · 端口 $port" \
+            "名称: $n\n端口: $port\n密码: $pw\n状态: $st" \
             "1" "复制 ss:// 链接到剪贴板" \
-            "2" "在终端显示完整链接" \
-            "0" "返回" 3>&1 1>&2 2>&3) || return 0
+            "2" "在终端显示完整链接") || return 0
         case "$c" in
             1)
                 copy_clip "$link"
@@ -372,7 +426,7 @@ config_detail() {
                 term_show "$tf" "端口 $port 的 SS 链接"
                 rm -f "$tf"
                 ;;
-            0|*) return 0 ;;
+            *) return 0 ;;
         esac
     done
 }
@@ -393,14 +447,12 @@ view_configs() {
             [ -z "$p" ] && continue
             n=$(get_name "$p"); [ -z "$n" ] && n="配置-$p"
             if [[ " $lst " == *" $p "* ]]; then st="[运行]"; else st="[停止]"; fi
-            items+=("$p" "$st $n")
+            items+=("$p" "$st 端口 $p · $n")
         done
-        items+=("0" "返回")
 
-        sel=$(whiptail --backtitle "$BACKTITLE" --title "配置列表" --menu \
-            "服务: $(svc_state_text)   加密: $(cfg_method)   BBR: $(bbr_state_text)\n服务器: ${SERVER_IP:-未知}   配置数: ${#ports[@]}\n\n选中某个配置可查看信息 / 复制 ss:// 链接" \
-            22 74 12 "${items[@]}" 3>&1 1>&2 2>&3) || return 0
-        [ "$sel" = "0" ] && return 0
+        sel=$(menu_pick "配置列表" \
+            "服务: $(svc_state_text)   加密: $(cfg_method)   BBR: $(bbr_state_text)\n服务器: ${SERVER_IP:-未知}   配置数: ${#ports[@]}\n\n选择配置查看信息 / 复制 ss:// 链接" \
+            "${items[@]}") || return 0
         config_detail "$sel"
     done
 }
@@ -521,16 +573,14 @@ change_password() {
 change_method() {
     local cur sel tmp
     cur=$(cfg_method)
-    clear
-    sel=$(whiptail --backtitle "$BACKTITLE" --title "加密方式" --menu \
-        "当前加密方式: $cur\n\n修改后所有配置的链接都会变化，需要同步更新客户端。" 22 72 8 \
+    sel=$(menu_pick "加密方式" \
+        "当前加密方式: $cur\n修改后所有配置的链接都会变化，需要同步更新客户端。" \
         "aes-256-gcm"             "推荐 · AEAD" \
         "aes-128-gcm"             "AEAD" \
         "chacha20-ietf-poly1305"  "AEAD · 移动设备友好" \
         "xchacha20-ietf-poly1305" "AEAD" \
         "aes-256-cfb"             "旧版 · 兼容性最好" \
-        "chacha20-ietf"           "旧版" \
-        3>&1 1>&2 2>&3) || return 0
+        "chacha20-ietf"           "旧版") || return 0
     [ -z "$sel" ] && return 0
     if [ "$sel" = "$cur" ]; then msg "加密方式未改变。" "提示"; return 0; fi
 
@@ -561,21 +611,18 @@ show_status() {
 service_menu() {
     local c
     while :; do
-        clear
-        c=$(whiptail --backtitle "$BACKTITLE" --title "服务管理" --menu \
-            "当前状态: $(svc_state_text)" 18 62 6 \
+        c=$(menu_pick "服务管理" "当前状态: $(svc_state_text)" \
             "1" "查看状态与日志" \
             "2" "重启服务" \
             "3" "停止服务" \
-            "4" "启动服务" \
-            "0" "返回" 3>&1 1>&2 2>&3) || return 0
+            "4" "启动服务") || return 0
         case "$c" in
             1) show_status ;;
             2) if svc_restart; then msg "服务已重启。" "完成"; else msg "重启失败，请查看日志。" "错误"; fi ;;
             3) systemctl stop "$SVC" >/dev/null 2>&1; msg "服务已停止。" "完成" ;;
             4) systemctl start "$SVC" >/dev/null 2>&1; sleep 1
                if systemctl is-active --quiet "$SVC"; then msg "服务已启动。" "完成"; else msg "启动失败，请查看日志。" "错误"; fi ;;
-            0|*) return 0 ;;
+            *) return 0 ;;
         esac
     done
 }
@@ -679,10 +726,8 @@ do_uninstall() {
 main_menu() {
     local c
     while :; do
-        clear
-        c=$(whiptail --backtitle "$BACKTITLE" --title " Shadowsocks 管理面板 " --menu \
+        c=$(menu_pick "Shadowsocks 管理面板" \
             "服务: $(svc_state_text)   配置数: $(count_ports)   加密: $(cfg_method)\nBBR: $(bbr_state_text)" \
-            22 70 12 \
             "1" "查看所有配置 (含复制链接)" \
             "2" "新增配置 (端口 + 密码)" \
             "3" "删除配置" \
@@ -691,8 +736,7 @@ main_menu() {
             "6" "服务状态 / 重启 / 停止" \
             "7" "防火墙放行已有端口 (ufw)" \
             "8" "网络优化 / BBR 拥塞控制" \
-            "9" "卸载面板 / 清理配置" \
-            "0" "退出" 3>&1 1>&2 2>&3) || break
+            "9" "卸载面板 / 清理配置") || break
         case "$c" in
             1) view_configs ;;
             2) add_config ;;
@@ -703,7 +747,6 @@ main_menu() {
             7) fw_sync_all ;;
             8) bbr_menu ;;
             9) if do_uninstall; then clear; echo "卸载完成，再见。"; exit 0; fi ;;
-            0) break ;;
         esac
     done
     clear
