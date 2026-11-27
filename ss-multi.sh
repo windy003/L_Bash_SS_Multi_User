@@ -9,6 +9,7 @@
 #    * 新增 / 删除配置、修改密码
 #    * 查看 ss:// 链接，支持 OSC52 复制到本地剪贴板 / 终端显示 / 导出文件
 #    * 服务状态查看、重启、加密方式切换、ufw 放行
+#    * 默认启用 TCP BBR 拥塞控制（内核级，对所有端口/配置统一生效）
 #
 #  用法:
 #    sudo bash ss-multi.sh            # 打开管理面板
@@ -27,6 +28,7 @@ CONF_FILE="$CONF_DIR/config.json"
 META_FILE="$CONF_DIR/meta.json"
 SVC="ss-multi"
 UNIT_FILE="/etc/systemd/system/${SVC}.service"
+BBR_CONF="/etc/sysctl.d/99-ss-multi-bbr.conf"
 DEF_METHOD="aes-256-gcm"
 BACKTITLE=" Shadowsocks 管理面板 "
 SERVER_IP=""
@@ -147,10 +149,66 @@ init_conf() {
     chmod 600 "$META_FILE"
 
     ensure_unit
+    ensure_bbr || true
 
     if ! systemctl is-active --quiet "$SVC" 2>/dev/null; then
         systemctl start "$SVC" >/dev/null 2>&1 || true
     fi
+}
+
+# ----------------------------------------------------------------------------
+# 网络优化: TCP BBR
+#   BBR 是内核级拥塞控制算法，开启一次即对面板中所有配置/端口同时生效。
+# ----------------------------------------------------------------------------
+cc_current() { sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown; }
+
+bbr_supported() {
+    local avail
+    avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    [[ " $avail " == *" bbr "* ]]
+}
+
+bbr_state_text() {
+    if [ "$(cc_current)" = "bbr" ]; then
+        echo "已启用 (bbr)"
+    else
+        echo "未启用 ($(cc_current))"
+    fi
+}
+
+# 幂等: 已启用则直接返回；首次写入 /etc/sysctl.d 并立即生效。
+# 提示信息走 stderr，避免污染 `links` 等命令的 stdout 输出。
+ensure_bbr() {
+    if [ "$(cc_current)" = "bbr" ] && [ -f "$BBR_CONF" ]; then
+        return 0
+    fi
+
+    if ! bbr_supported; then
+        modprobe tcp_bbr >/dev/null 2>&1 || true
+        bbr_supported || {
+            info "当前内核不支持 BBR (需 Linux 4.9+)，已跳过 BBR 优化" >&2
+            return 1
+        }
+    fi
+
+    cat > "$BBR_CONF" <<'EOF'
+# ss-multi: TCP BBR 拥塞控制优化（全局生效，覆盖所有配置端口）
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+EOF
+    chmod 644 "$BBR_CONF"
+
+    # 某些环境中部分键写入失败不影响 bbr 生效，因此不因 sysctl 返回码中断，以实际算法为准
+    sysctl -p "$BBR_CONF" >/dev/null 2>&1 || true
+
+    if [ "$(cc_current)" = "bbr" ]; then
+        info "已启用 TCP BBR 拥塞控制（对所有配置生效）" >&2
+        return 0
+    fi
+    info "BBR 参数已写入，但当前拥塞控制仍为 $(cc_current)（容器/受限环境常见）" >&2
+    return 1
 }
 
 # ----------------------------------------------------------------------------
@@ -271,6 +329,7 @@ view_configs() {
     {
         printf '服务状态 : %s\n' "$(svc_state_text)"
         printf '加密方式 : %s\n' "$(cfg_method)"
+        printf '拥塞控制 : %s\n' "$(bbr_state_text)"
         printf '配置数量 : %s\n' "$(count_ports)"
         printf '配置文件 : %s\n' "$CONF_FILE"
         printf '服务器IP : %s\n\n' "${SERVER_IP:-未知}"
@@ -333,6 +392,8 @@ add_config() {
     chmod 600 "$CONF_FILE"
     set_meta_name "$port" "$name"
 
+    # 新配置同样享有 BBR（幂等：已开启则瞬间返回）
+    ensure_bbr || true
     fw_open_port "$port"
 
     if svc_restart; then
@@ -565,6 +626,19 @@ fw_sync_all() {
     msg "已为所有配置端口放行 TCP/UDP。" "完成"
 }
 
+bbr_menu() {
+    local avail
+    avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo 未知)
+    if ! confirm "当前拥塞控制: $(bbr_state_text)\n可用算法: $avail\n\nBBR 是内核级优化，对本面板中的所有配置(端口)同时生效，\n无需逐个端口设置。\n\n是否立即应用 / 重新应用 BBR？" "网络优化 (BBR)"; then
+        return 0
+    fi
+    if ensure_bbr; then
+        msg "BBR 已启用。\n\n拥塞控制: $(cc_current)\n队列规则: $(sysctl -n net.core.default_qdisc 2>/dev/null || echo 未知)\n\n对所有配置(端口)生效。" "完成"
+    else
+        msg "BBR 启用失败。\n\n当前拥塞控制: $(cc_current)\n可用算法: $avail\n\n常见原因:\n  - 内核低于 4.9 (uname -r 查看)\n  - 运行在容器 / 受限环境" "失败"
+    fi
+}
+
 # ----------------------------------------------------------------------------
 # 主菜单
 # ----------------------------------------------------------------------------
@@ -573,8 +647,8 @@ main_menu() {
     while :; do
         clear
         c=$(whiptail --backtitle "$BACKTITLE" --title " Shadowsocks 管理面板 " --menu \
-            "服务: $(svc_state_text)   配置数: $(count_ports)   加密: $(cfg_method)" \
-            22 70 11 \
+            "服务: $(svc_state_text)   配置数: $(count_ports)   加密: $(cfg_method)\nBBR: $(bbr_state_text)" \
+            22 70 12 \
             "1" "查看所有配置" \
             "2" "新增配置 (端口 + 密码)" \
             "3" "删除配置" \
@@ -583,6 +657,7 @@ main_menu() {
             "6" "更改加密方式" \
             "7" "服务状态 / 重启 / 停止" \
             "8" "防火墙放行已有端口 (ufw)" \
+            "9" "网络优化 / BBR 拥塞控制" \
             "0" "退出" 3>&1 1>&2 2>&3) || break
         case "$c" in
             1) view_configs ;;
@@ -593,6 +668,7 @@ main_menu() {
             6) change_method ;;
             7) service_menu ;;
             8) fw_sync_all ;;
+            9) bbr_menu ;;
             0) break ;;
         esac
     done
