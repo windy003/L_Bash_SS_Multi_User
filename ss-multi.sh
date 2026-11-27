@@ -42,11 +42,16 @@ if [ -z "${LANG:-}" ] || [[ "${LANG}" != *UTF-8* && "${LANG}" != *utf8* ]]; then
     export LANG="C.UTF-8"
 fi
 
+# 终端文字颜色：统一黑色（30 = 黑，0 = 复位）。
+# 如果终端是深色背景导致文字看不见，把 CLR 改成空字符串 CLR='' 即可用终端默认前景色。
+CLR=$'\033[30m'
+CLR_OFF=$'\033[0m'
+
 # ----------------------------------------------------------------------------
 # 基础工具
 # ----------------------------------------------------------------------------
-die()  { printf '\033[31m[错误]\033[0m %s\n' "$*" >&2; exit 1; }
-info() { printf '\033[36m%s\033[0m\n' "$*"; }
+die()  { printf '%s[错误]%s %s\n' "$CLR" "$CLR_OFF" "$*" >&2; exit 1; }
+info() { printf '%s%s%s\n' "$CLR" "$*" "$CLR_OFF"; }
 
 require_root() {
     [ "$(id -u)" -eq 0 ] || die "请使用 root 运行: sudo bash $0"
@@ -306,7 +311,7 @@ copy_clip() {
 term_show() {
     local f=$1 title=$2
     clear
-    printf '\n\033[1m%s\033[0m\n\n' "$title"
+    printf '\n%s%s%s\n\n' "$CLR" "$title" "$CLR_OFF"
     cat "$f"
     printf '\n%s\n' "----------------------------------------------------------------"
     printf '%s\n' "提示: 大部分终端可直接用鼠标选中复制；Windows Terminal / iTerm2 / Kitty"
@@ -345,16 +350,16 @@ menu_pick() {
         [ "$end" -ge "$total" ] && end=$(( total - 1 ))
         {
             clear
-            printf '\n\033[1;36m== %s ==\033[0m\n\n' "$title"
+            printf '\n%s== %s ==%s\n\n' "$CLR" "$title" "$CLR_OFF"
             [ -n "$prompt" ] && printf '%b\n\n' "$prompt"
             for ((i = start; i <= end; i++)); do
-                printf '  \033[1;33m%d\033[0m) %s\n' "$(( i - start + 1 ))" "${descs[$i]}"
+                printf '  %s%d%s) %s\n' "$CLR" "$(( i - start + 1 ))" "$CLR_OFF" "${descs[$i]}"
             done
             printf '\n'
             if [ "$pages" -gt 1 ]; then
-                printf '  \033[2m第 %d/%d 页  n 下一页  p 上一页\033[0m\n' "$(( page + 1 ))" "$pages"
+                printf '  %s第 %d/%d 页  n 下一页  p 上一页%s\n' "$CLR" "$(( page + 1 ))" "$pages" "$CLR_OFF"
             fi
-            printf '  \033[2m按数字键立即选择，q 返回\033[0m\n'
+            printf '  %s按数字键立即选择，q 返回%s\n' "$CLR" "$CLR_OFF"
         } >&2
 
         if ! IFS= read -rsn1 key; then
@@ -600,9 +605,9 @@ change_method() {
 # ----------------------------------------------------------------------------
 show_status() {
     clear
-    printf '\n\033[1m=== systemctl status %s ===\033[0m\n\n' "$SVC"
+    printf '\n%s=== systemctl status %s ===%s\n\n' "$CLR" "$SVC" "$CLR_OFF"
     systemctl status "$SVC" --no-pager -l 2>&1 | head -n 30
-    printf '\n\033[1m=== 最近日志 ===\033[0m\n\n'
+    printf '\n%s=== 最近日志 ===%s\n\n' "$CLR" "$CLR_OFF"
     journalctl -u "$SVC" -n 15 --no-pager 2>&1
     printf '\n按回车返回...'
     read -r _ || true
