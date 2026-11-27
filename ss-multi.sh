@@ -8,9 +8,9 @@
 #    * 一个配置 = 一个端口 + 一个密码（ss-manager 按端口拉起多个 ss-server 实例）
 #    * 新增 / 删除配置、修改密码
 #    * 在「查看所有配置」中逐个查看详情、复制 ss:// 链接（OSC52）/ 终端显示
-#    * 服务状态查看、重启、ufw 放行
+#    * 服务状态查看、重启（新增端口时后台自动放行 ufw）
 #    * 后台自动启用 TCP BBR 拥塞控制（无菜单入口，对所有端口/配置统一生效）
-#    * 一键卸载（可单独选择清理 ufw / 软件包）
+#    * 一键卸载（可单独选择卸载软件包）
 #
 #  用法:
 #    sudo bash ss-multi.sh            # 打开管理面板
@@ -543,8 +543,9 @@ delete_config() {
     jq --arg p "$port" 'del(.[$p])' "$META_FILE" > "$pwtmp" && mv "$pwtmp" "$META_FILE"
     chmod 600 "$CONF_FILE" "$META_FILE"
 
+    fw_close_port "$port"
     svc_restart
-    msg "已删除端口 $port 的配置。\n\n提示: ufw 放行规则不会被自动删除，如需清理:\n  ufw delete allow $port/tcp\n  ufw delete allow $port/udp" "完成"
+    msg "已删除端口 $port 的配置。" "完成"
 }
 
 # ----------------------------------------------------------------------------
@@ -581,7 +582,7 @@ change_password() {
 }
 
 # ----------------------------------------------------------------------------
-# 功能: 服务管理 / 防火墙
+# 功能: 服务管理
 # ----------------------------------------------------------------------------
 show_status() {
     clear
@@ -612,6 +613,7 @@ service_menu() {
     done
 }
 
+# 防火墙在后台静默处理：新增端口自动放行，删除配置自动回收
 fw_open_port() {
     local port=$1 st
     command -v ufw >/dev/null 2>&1 || return 0
@@ -621,21 +623,11 @@ fw_open_port() {
     ufw allow "$port/udp" >/dev/null 2>&1
 }
 
-fw_sync_all() {
-    local st p
-    if ! command -v ufw >/dev/null 2>&1; then
-        msg "系统未安装 ufw，跳过。\n\n请记得在云厂商安全组中放行对应端口。" "提示"; return 0
-    fi
-    st=$(ufw status 2>/dev/null || true)
-    if [[ "$st" != *"Status: active"* ]]; then
-        msg "ufw 当前未启用，无需操作。\n\n请记得在云厂商安全组中放行对应端口。" "提示"; return 0
-    fi
-    while read -r p; do
-        [ -z "$p" ] && continue
-        ufw allow "$p/tcp" >/dev/null 2>&1
-        ufw allow "$p/udp" >/dev/null 2>&1
-    done < <(list_ports)
-    msg "已为所有配置端口放行 TCP/UDP。" "完成"
+fw_close_port() {
+    local port=$1
+    command -v ufw >/dev/null 2>&1 || return 0
+    ufw delete allow "$port/tcp" >/dev/null 2>&1 || true
+    ufw delete allow "$port/udp" >/dev/null 2>&1 || true
 }
 
 # ----------------------------------------------------------------------------
@@ -643,14 +635,11 @@ fw_sync_all() {
 #   所有确认默认都是「否」，避免误触。
 # ----------------------------------------------------------------------------
 do_uninstall() {
-    local ports port list rmv_ufw=0 rmv_pkg=0
+    local ports port rmv_pkg=0 ufw_txt="未安装，跳过"
     ports=$(list_ports 2>/dev/null || true)
-    list=$(printf '%s\n' "$ports" | grep -v '^$' | paste -sd ',' - 2>/dev/null)
-    [ -z "$list" ] && list="无"
 
-    confirm_no "即将卸载 Shadowsocks 多用户面板，将执行:\n\n  - 停止并禁用服务: $SVC\n  - 删除 systemd 单元: $UNIT_FILE\n  - 删除配置目录: $CONF_DIR\n    (含全部端口、密码、备注)\n\n此操作不可恢复！确定继续？" "卸载确认" || return 1
+    confirm_no "即将卸载 Shadowsocks 多用户面板，将执行:\n\n  - 停止并禁用服务: $SVC\n  - 删除 systemd 单元: $UNIT_FILE\n  - 删除配置目录: $CONF_DIR\n    (含全部端口、密码、备注)\n  - 回收本面板放行的 ufw 端口\n\n此操作不可恢复！确定继续？" "卸载确认" || return 1
 
-    confirm_no "是否同时删除 ufw 中已放行的端口规则？\n\n端口: $list" "防火墙规则" && rmv_ufw=1
     confirm_no "是否卸载 shadowsocks-libev 软件包？\n\n注意: 若系统上还有其它程序依赖它，请选「否」。" "软件包" && rmv_pkg=1
 
     # 1) 停止并移除服务
@@ -658,8 +647,9 @@ do_uninstall() {
     rm -f "$UNIT_FILE"
     systemctl daemon-reload >/dev/null 2>&1 || true
 
-    # 2) 清理 ufw 规则（使用卸载前缓存的端口列表）
-    if [ "$rmv_ufw" -eq 1 ] && command -v ufw >/dev/null 2>&1; then
+    # 2) 回收 ufw 规则（使用卸载前缓存的端口列表）
+    if command -v ufw >/dev/null 2>&1; then
+        ufw_txt="已清理"
         while read -r port; do
             [ -z "$port" ] && continue
             ufw delete allow "$port/tcp" >/dev/null 2>&1 || true
@@ -680,8 +670,7 @@ do_uninstall() {
         apt-get remove -y shadowsocks-libev >/dev/null 2>&1 || true
     fi
 
-    local ufw_txt="保留" pkg_txt="保留"
-    [ "$rmv_ufw" -eq 1 ] && ufw_txt="已清理"
+    local pkg_txt="保留"
     [ "$rmv_pkg" -eq 1 ] && pkg_txt="已卸载"
 
     msg "卸载完成。\n\n  - 服务 / systemd 单元 : 已移除\n  - 配置目录            : 已删除\n  - ufw 端口规则        : $ufw_txt\n  - BBR 优化            : 已移除\n  - shadowsocks-libev   : $pkg_txt" "完成"
@@ -701,16 +690,14 @@ main_menu() {
             "3" "删除配置" \
             "4" "修改密码" \
             "5" "服务状态 / 重启 / 停止" \
-            "6" "防火墙放行已有端口 (ufw)" \
-            "7" "卸载面板 / 清理配置") || break
+            "6" "卸载面板 / 清理配置") || break
         case "$c" in
             1) view_configs ;;
             2) add_config ;;
             3) delete_config ;;
             4) change_password ;;
             5) service_menu ;;
-            6) fw_sync_all ;;
-            7) if do_uninstall; then clear; echo "卸载完成，再见。"; exit 0; fi ;;
+            6) if do_uninstall; then clear; echo "卸载完成，再见。"; exit 0; fi ;;
         esac
     done
     clear
