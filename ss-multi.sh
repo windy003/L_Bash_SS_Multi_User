@@ -37,17 +37,11 @@ if [ -z "${LANG:-}" ] || [[ "${LANG}" != *UTF-8* && "${LANG}" != *utf8* ]]; then
     export LANG="C.UTF-8"
 fi
 
-# 终端文字颜色：默认使用终端自身的前景色，浅色主题下是黑、深色主题下是白，
-# 避免在手机终端（如 JuiceSSH 深色背景）或黑色背景下出现看不见的文字。
-# 如需强制某个颜色，例如黑色：CLR=$'\033[30m'
-CLR=''
-CLR_OFF=''
-
 # ----------------------------------------------------------------------------
 # 基础工具
 # ----------------------------------------------------------------------------
-die()  { printf '%s[错误]%s %s\n' "$CLR" "$CLR_OFF" "$*" >&2; exit 1; }
-info() { printf '%s%s%s\n' "$CLR" "$*" "$CLR_OFF"; }
+die()  { printf '[错误] %s\n' "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*"; }
 
 require_root() {
     [ "$(id -u)" -eq 0 ] || die "请使用 root 运行: sudo bash $0"
@@ -307,7 +301,7 @@ copy_clip() {
 term_show() {
     local f=$1 title=$2
     clear
-    printf '\n%s%s%s\n\n' "$CLR" "$title" "$CLR_OFF"
+    printf '\n%s\n\n' "$title"
     cat "$f"
     printf '\n%s\n' "----------------------------------------------------------------"
     printf '%s\n' "提示: 大部分终端可直接用鼠标选中复制；Windows Terminal / iTerm2 / Kitty"
@@ -346,16 +340,16 @@ menu_pick() {
         [ "$end" -ge "$total" ] && end=$(( total - 1 ))
         {
             clear
-            printf '\n%s== %s ==%s\n\n' "$CLR" "$title" "$CLR_OFF"
+            printf '\n== %s ==\n\n' "$title"
             [ -n "$prompt" ] && printf '%b\n\n' "$prompt"
             for ((i = start; i <= end; i++)); do
-                printf '  %s%d%s) %s\n' "$CLR" "$(( i - start + 1 ))" "$CLR_OFF" "${descs[$i]}"
+                printf '  %d) %s\n' "$(( i - start + 1 ))" "${descs[$i]}"
             done
             printf '\n'
             if [ "$pages" -gt 1 ]; then
-                printf '  %s第 %d/%d 页  n 下一页  p 上一页%s\n' "$CLR" "$(( page + 1 ))" "$pages" "$CLR_OFF"
+                printf '  第 %d/%d 页  n 下一页  p 上一页\n' "$(( page + 1 ))" "$pages"
             fi
-            printf '  %s按数字键立即选择，q 返回%s\n' "$CLR" "$CLR_OFF"
+            printf '  按数字键立即选择，q 返回\n'
         } >&2
 
         if ! IFS= read -rsn1 key; then
@@ -575,9 +569,9 @@ change_password() {
 # ----------------------------------------------------------------------------
 show_status() {
     clear
-    printf '\n%s=== systemctl status %s ===%s\n\n' "$CLR" "$SVC" "$CLR_OFF"
+    printf '\n=== systemctl status %s ===\n\n' "$SVC"
     systemctl status "$SVC" --no-pager -l 2>&1 | head -n 30
-    printf '\n%s=== 最近日志 ===%s\n\n' "$CLR" "$CLR_OFF"
+    printf '\n=== 最近日志 ===\n\n'
     journalctl -u "$SVC" -n 15 --no-pager 2>&1
     printf '\n按回车返回...'
     read -r _ || true
