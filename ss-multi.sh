@@ -5,7 +5,7 @@
 #
 #  功能:
 #    * whiptail TUI 管理界面
-#    * 一个配置 = 一个端口 + 一个密码（同一个 ss-server 进程内并行）
+#    * 一个配置 = 一个端口 + 一个密码（ss-manager 按端口拉起多个 ss-server 实例）
 #    * 新增 / 删除配置、修改密码
 #    * 在「查看所有配置」中逐个查看详情、复制 ss:// 链接（OSC52）/ 终端显示
 #    * 服务状态查看、重启、加密方式切换、ufw 放行
@@ -77,10 +77,11 @@ detect_ip() {
 # ----------------------------------------------------------------------------
 bootstrap() {
     local need=0
-    command -v whiptail  >/dev/null 2>&1 || need=1
-    command -v jq        >/dev/null 2>&1 || need=1
-    command -v curl      >/dev/null 2>&1 || need=1
-    command -v ss-server >/dev/null 2>&1 || need=1
+    command -v whiptail   >/dev/null 2>&1 || need=1
+    command -v jq         >/dev/null 2>&1 || need=1
+    command -v curl       >/dev/null 2>&1 || need=1
+    command -v ss-server  >/dev/null 2>&1 || need=1
+    command -v ss-manager >/dev/null 2>&1 || need=1
     [ "$need" -eq 0 ] && return 0
 
     info "首次运行，正在安装依赖 (shadowsocks-libev / jq / curl / whiptail)..."
@@ -88,7 +89,7 @@ bootstrap() {
     apt-get update -y >/dev/null 2>&1 || die "apt-get update 失败，请检查网络"
     apt-get install -y shadowsocks-libev jq curl whiptail ca-certificates >/dev/null 2>&1
 
-    if ! command -v ss-server >/dev/null 2>&1; then
+    if ! command -v ss-server >/dev/null 2>&1 || ! command -v ss-manager >/dev/null 2>&1; then
         info "尝试启用 universe 仓库..."
         apt-get install -y software-properties-common >/dev/null 2>&1
         add-apt-repository -y universe >/dev/null 2>&1
@@ -96,14 +97,19 @@ bootstrap() {
         apt-get install -y shadowsocks-libev >/dev/null 2>&1
     fi
 
-    command -v ss-server >/dev/null 2>&1 || die "shadowsocks-libev 安装失败，请手动安装后重试"
-    command -v whiptail  >/dev/null 2>&1 || die "whiptail 安装失败"
-    command -v jq        >/dev/null 2>&1 || die "jq 安装失败"
+    command -v ss-server  >/dev/null 2>&1 || die "shadowsocks-libev 安装失败，请手动安装后重试"
+    command -v ss-manager >/dev/null 2>&1 || die "ss-manager 安装失败（shadowsocks-libev 包内应包含），请手动检查"
+    command -v whiptail   >/dev/null 2>&1 || die "whiptail 安装失败"
+    command -v jq         >/dev/null 2>&1 || die "jq 安装失败"
     info "依赖安装完成"
 }
 
+# ss-server 不解析 config.json 里的 port_password（只有 ss-manager 支持），
+# 所以由 ss-manager 读取同一份配置，并按端口拉起多个 ss-server 子进程。
 ensure_unit() {
-    cat > "$UNIT_FILE" <<'EOF'
+    local tmp changed=0
+    tmp=$(mktemp)
+    cat > "$tmp" <<'EOF'
 [Unit]
 Description=Shadowsocks Multi-Config Server
 After=network-online.target
@@ -111,7 +117,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/ss-server -c /etc/ss-multi/config.json -u
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/ss-manager -c /etc/ss-multi/config.json -u --workdir /etc/ss-multi
 Restart=always
 RestartSec=3
 LimitNOFILE=65535
@@ -122,6 +129,12 @@ PrivateTmp=true
 WantedBy=multi-user.target
 EOF
 
+    if ! cmp -s "$tmp" "$UNIT_FILE" 2>/dev/null; then
+        changed=1
+        install -m 644 "$tmp" "$UNIT_FILE"
+    fi
+    rm -f "$tmp"
+
     # 关掉软件包自带的单实例服务，避免和本面板抢端口
     if systemctl cat shadowsocks-libev.service >/dev/null 2>&1; then
         systemctl disable --now shadowsocks-libev.service >/dev/null 2>&1 || true
@@ -129,6 +142,11 @@ EOF
 
     systemctl daemon-reload
     systemctl enable "$SVC" >/dev/null 2>&1 || true
+
+    # 单元有变化且服务仍在跑（例如从旧的 ss-server 单元升级）-> 立即重启生效
+    if [ "$changed" -eq 1 ] && systemctl is-active --quiet "$SVC" 2>/dev/null; then
+        systemctl restart "$SVC" >/dev/null 2>&1 || true
+    fi
 }
 
 init_conf() {
