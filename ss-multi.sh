@@ -8,7 +8,7 @@
 #    * 一个配置 = 一个端口 + 一个密码（ss-manager 按端口拉起多个 ss-server 实例）
 #    * 新增 / 删除配置、修改密码
 #    * 在「查看所有配置」中逐个查看详情、复制 ss:// 链接（OSC52）/ 终端显示
-#    * 服务状态查看、重启、加密方式切换、ufw 放行
+#    * 服务状态查看、重启、ufw 放行
 #    * 默认启用 TCP BBR 拥塞控制（内核级，对所有端口/配置统一生效）
 #    * 一键卸载（可单独选择清理 ufw / BBR / 软件包）
 #
@@ -589,34 +589,6 @@ change_password() {
 }
 
 # ----------------------------------------------------------------------------
-# 功能: 加密方式
-# ----------------------------------------------------------------------------
-change_method() {
-    local cur sel tmp
-    cur=$(cfg_method)
-    sel=$(menu_pick "加密方式" \
-        "当前加密方式: $cur\n修改后所有配置的链接都会变化，需要同步更新客户端。" \
-        "aes-256-gcm"             "推荐 · AEAD" \
-        "aes-128-gcm"             "AEAD" \
-        "chacha20-ietf-poly1305"  "AEAD · 移动设备友好" \
-        "xchacha20-ietf-poly1305" "AEAD" \
-        "aes-256-cfb"             "旧版 · 兼容性最好" \
-        "chacha20-ietf"           "旧版") || return 0
-    [ -z "$sel" ] && return 0
-    if [ "$sel" = "$cur" ]; then msg "加密方式未改变。" "提示"; return 0; fi
-
-    tmp=$(mktemp)
-    jq --arg m "$sel" '.method = $m' "$CONF_FILE" > "$tmp" && mv "$tmp" "$CONF_FILE"
-    chmod 600 "$CONF_FILE"
-
-    if svc_restart; then
-        msg "已切换加密方式为: $sel\n\n请在所有客户端中同步修改，否则无法连接。" "完成"
-    else
-        msg "服务重启失败，请查看日志:\n  journalctl -u $SVC -n 50" "错误"
-    fi
-}
-
-# ----------------------------------------------------------------------------
 # 功能: 服务管理 / 防火墙
 # ----------------------------------------------------------------------------
 show_status() {
@@ -753,21 +725,19 @@ main_menu() {
             "2" "新增配置 (端口 + 密码)" \
             "3" "删除配置" \
             "4" "修改密码" \
-            "5" "更改加密方式" \
-            "6" "服务状态 / 重启 / 停止" \
-            "7" "防火墙放行已有端口 (ufw)" \
-            "8" "网络优化 / BBR 拥塞控制" \
-            "9" "卸载面板 / 清理配置") || break
+            "5" "服务状态 / 重启 / 停止" \
+            "6" "防火墙放行已有端口 (ufw)" \
+            "7" "网络优化 / BBR 拥塞控制" \
+            "8" "卸载面板 / 清理配置") || break
         case "$c" in
             1) view_configs ;;
             2) add_config ;;
             3) delete_config ;;
             4) change_password ;;
-            5) change_method ;;
-            6) service_menu ;;
-            7) fw_sync_all ;;
-            8) bbr_menu ;;
-            9) if do_uninstall; then clear; echo "卸载完成，再见。"; exit 0; fi ;;
+            5) service_menu ;;
+            6) fw_sync_all ;;
+            7) bbr_menu ;;
+            8) if do_uninstall; then clear; echo "卸载完成，再见。"; exit 0; fi ;;
         esac
     done
     clear
